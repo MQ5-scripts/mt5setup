@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e  # exit on error
 
 URL="https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
