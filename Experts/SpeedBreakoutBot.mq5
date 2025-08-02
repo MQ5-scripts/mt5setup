@@ -17,6 +17,7 @@ input int      TradingEndHour       = 16;
 input int      TimerIntervalSeconds = 30;         // Timer interval in seconds
 input bool     EnableDynamicOrders  = true;       // Enable dynamic order updates
 input int      MaxPositions         = 1;          // Maximum open positions
+input int      StartupMonitorMinutes = 20;        // Monitor-only period before trading (minutes)
 
 // Order tickets
 ulong buyStopTicket = 0;
@@ -24,9 +25,15 @@ ulong sellStopTicket = 0;
 
 // Position tracking
 datetime lastPositionCheck = 0;
+datetime botStartTime = 0;
+datetime botStartTimeLocal = 0;
 
 //+------------------------------------------------------------------+
 int OnInit() {
+   // Record bot start time (both server and local)
+   botStartTime = TimeCurrent();
+   botStartTimeLocal = TimeLocal();
+   
    // Validate inputs
    if (SpeedPeriod <= 0) {
       Print("Error: SpeedPeriod must be greater than 0");
@@ -47,6 +54,13 @@ int OnInit() {
    Print("Timer interval: ", TimerIntervalSeconds, " seconds");
    Print("Trading hours: ", TradingStartHour, ":00 - ", TradingEndHour, ":00");
    
+   datetime tradingStartTimeLocal = botStartTimeLocal + StartupMonitorMinutes * 60;
+   Print("Server time: ", TimeToString(botStartTime, TIME_MINUTES));
+   Print("Local time: ", TimeToString(botStartTimeLocal, TIME_MINUTES));
+   Print("Startup monitoring period: ", StartupMonitorMinutes, " minutes");
+   Print("Will start trading after: ", TimeToString(tradingStartTimeLocal, TIME_MINUTES), " (local time)");
+   Print("Speed calculation needs ", SpeedPeriod, " historical candles (", SpeedPeriod, " minutes on M1)");
+   
    return INIT_SUCCEEDED;
 }
 //+------------------------------------------------------------------+
@@ -59,7 +73,65 @@ void OnDeinit(const int reason) {
 double CalculateSpeed(int shift) {
    double open = iOpen(InpSymbol, InpTimeframe, shift);
    double close = iClose(InpSymbol, InpTimeframe, shift);
+   double speed = MathAbs(close - open);
+   
+   // Debug output for current candle
+   if (shift == 0) {
+      static datetime lastDebugTime = 0;
+      datetime currentTime = TimeCurrent();
+      if (currentTime - lastDebugTime > 60) { // Debug every minute
+         Print("DEBUG Current candle (shift 0): Open=", open, ", Close=", close, ", Speed=", speed);
+         Print("DEBUG Last completed candle (shift 1): Open=", iOpen(InpSymbol, InpTimeframe, 1), 
+               ", Close=", iClose(InpSymbol, InpTimeframe, 1), ", Speed=", CalculateSpeedInternal(1));
+         lastDebugTime = currentTime;
+      }
+   }
+   
+   return speed;
+}
+//+------------------------------------------------------------------+
+double CalculateSpeedInternal(int shift) {
+   double open = iOpen(InpSymbol, InpTimeframe, shift);
+   double close = iClose(InpSymbol, InpTimeframe, shift);
    return MathAbs(close - open);
+}
+//+------------------------------------------------------------------+
+double CalculateCurrentSpeed() {
+   // For current speed, we have several options:
+   // Option 1: Use the last completed candle (most reliable)
+   // Option 2: Use current candle's range (open to current price)
+   // Option 3: Use recent price movement over last few ticks
+   
+   // Let's use Option 2: Current candle's movement from open to current price
+   double open = iOpen(InpSymbol, InpTimeframe, 0);
+   double currentPrice = (SymbolInfoDouble(InpSymbol, SYMBOL_ASK) + SymbolInfoDouble(InpSymbol, SYMBOL_BID)) / 2.0;
+   double currentCandleSpeed = MathAbs(currentPrice - open);
+   
+   // Also calculate the last completed candle speed for comparison
+   double lastCompletedSpeed = CalculateSpeed(1);
+   
+   // Use current candle speed primarily, but if it's very small and we're early in the candle,
+   // consider last completed candle as a backup reference
+   double speed = currentCandleSpeed;
+   
+   // If current candle speed is very small, we might want to check if there was recent activity
+   if (currentCandleSpeed < lastCompletedSpeed * 0.1) {
+      // Current candle is much quieter than last one, use current candle speed (which is low)
+      speed = currentCandleSpeed;
+   }
+   
+   static datetime lastDebugTime = 0;
+   datetime currentTime = TimeCurrent();
+   if (currentTime - lastDebugTime > 60) { // Debug every minute
+      Print("DEBUG Speed calculation:");
+      Print("  Current candle open: ", open, ", Current mid price: ", currentPrice);
+      Print("  Current candle speed: ", currentCandleSpeed);
+      Print("  Last completed candle speed: ", lastCompletedSpeed);
+      Print("  Selected speed: ", speed, " (using current candle speed)");
+      lastDebugTime = currentTime;
+   }
+   
+   return speed;
 }
 //+------------------------------------------------------------------+
 double AverageSpeed() {
@@ -197,7 +269,7 @@ bool ModifyOrder(ulong ticket, double newPrice, double newSL, double newTP) {
 }
 //+------------------------------------------------------------------+
 void PlaceOrUpdateOrders(double ask, double bid) {
-   double speedNow = CalculateSpeed(0);
+   double speedNow = CalculateCurrentSpeed(); // Use new current speed calculation
    double avgSpeed = AverageSpeed();
    double threshold = avgSpeed * SpeedMultiplier;
 
@@ -258,7 +330,21 @@ bool IsTradingTime() {
    TimeToStruct(now, dt);
    int hour = dt.hour;
    
-   return (hour >= TradingStartHour && hour < TradingEndHour);
+   // Check if market is open
+   if (!SymbolInfoInteger(InpSymbol, SYMBOL_TRADE_MODE)) {
+      return false; // Trading is disabled for this symbol
+   }
+   
+   // Check market session
+   datetime sessionStart, sessionEnd;
+   if (!SymbolInfoSessionTrade(InpSymbol, (ENUM_DAY_OF_WEEK)dt.day_of_week, 0, sessionStart, sessionEnd)) {
+      return false; // Cannot get session info
+   }
+   
+   // Simple time check (can be enhanced for more precise session checking)
+   bool withinHours = (hour >= TradingStartHour && hour < TradingEndHour);
+   
+   return withinHours;
 }
 //+------------------------------------------------------------------+
 void CheckAndCleanupExecutedOrders() {
@@ -276,8 +362,20 @@ void CheckAndCleanupExecutedOrders() {
 }
 //+------------------------------------------------------------------+
 void OnTimer() {
+   datetime now = TimeCurrent();
+   datetime nowLocal = TimeLocal();
+   
+   // Calculate startup period based on local time (more reliable when markets are closed)
+   bool isStartupPeriod = (nowLocal - botStartTimeLocal < StartupMonitorMinutes * 60);
+   
    // Check if we're in trading hours
    if (!IsTradingTime()) {
+      static datetime lastMarketMessage = 0;
+      if (nowLocal - lastMarketMessage > 3600) { // Message every hour when market is closed
+         Print("Market is closed or outside trading hours. ", isStartupPeriod ? "Monitoring only." : "Waiting...");
+         Print("Local time: ", TimeToString(nowLocal, TIME_MINUTES), " | Server time: ", TimeToString(now, TIME_MINUTES));
+         lastMarketMessage = nowLocal;
+      }
       CancelOrders(); // Outside trading window
       return;
    }
@@ -294,21 +392,49 @@ void OnTimer() {
       return;
    }
    
-   // Calculate current speed metrics
-   double speedNow = CalculateSpeed(0);
+   // Calculate current speed metrics (always monitor)
+   double speedNow = CalculateCurrentSpeed();
    double avgSpeed = AverageSpeed();
    double maxSpeed = MaxSpeed();
+   double threshold = avgSpeed * SpeedMultiplier;
    
    // Log speed information periodically
    static int logCounter = 0;
    if (++logCounter >= 10) { // Log every 10 timer calls
-      Print("Speed metrics - Current: ", speedNow, ", Average: ", avgSpeed, ", Max: ", maxSpeed);
-      Print("Active positions: ", CountOpenPositions(), ", Pending orders: ", (buyStopTicket > 0 ? 1 : 0) + (sellStopTicket > 0 ? 1 : 0));
+      if (isStartupPeriod) {
+         int remainingMinutes = (int)((StartupMonitorMinutes * 60 - (nowLocal - botStartTimeLocal)) / 60);
+         Print("MONITORING PHASE (", remainingMinutes, " min remaining) - Speed metrics:");
+      } else {
+         Print("TRADING PHASE - Speed metrics:");
+      }
+      Print("  Current: ", speedNow, ", Average: ", avgSpeed, ", Max: ", maxSpeed, ", Threshold: ", threshold);
+      Print("  Active positions: ", CountOpenPositions(), ", Pending orders: ", (buyStopTicket > 0 ? 1 : 0) + (sellStopTicket > 0 ? 1 : 0));
+      
+      if (speedNow >= threshold) {
+         if (isStartupPeriod) {
+            Print("  SPEED TRIGGER detected but in monitoring phase - no trading yet");
+         } else {
+            Print("  SPEED TRIGGER: Current speed (", speedNow, ") >= Threshold (", threshold, ")");
+         }
+      } else {
+         Print("  Waiting for speed trigger. Need: ", threshold, ", Current: ", speedNow);
+      }
       logCounter = 0;
    }
    
-   // Place or update orders
-   PlaceOrUpdateOrders(ask, bid);
+   // Only place orders if startup period is over
+   if (!isStartupPeriod) {
+      PlaceOrUpdateOrders(ask, bid);
+   } else {
+      // During startup, just monitor but provide occasional feedback
+      static datetime lastStartupMessage = 0;
+      if (nowLocal - lastStartupMessage > 300) { // Message every 5 minutes during startup
+         int remainingMinutes = (int)((StartupMonitorMinutes * 60 - (nowLocal - botStartTimeLocal)) / 60);
+         Print("Monitoring market conditions. Trading begins in ", remainingMinutes, " minutes... (Local: ", TimeToString(nowLocal, TIME_MINUTES), ")");
+         Print("Current speed data: Current=", speedNow, ", Average=", avgSpeed, ", Threshold=", threshold);
+         lastStartupMessage = nowLocal;
+      }
+   }
 }
 //+------------------------------------------------------------------+
 void OnTick() {
