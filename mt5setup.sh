@@ -38,7 +38,7 @@ if ! command -v wine &> /dev/null; then
 fi
 
 export WINEPREFIX=~/.mt5
-export WINEARCH=win32
+# export WINEARCH=win32
 
 wineboot --init
 sleep 5
