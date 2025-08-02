@@ -28,7 +28,7 @@ sudo apt update
 sudo apt install -y --install-recommends winehq-$WINE_VERSION
 sudo apt install -y winetricks
 
-mkdir -p ~/mt5install && cd ~/mt5install
+mkdir -p ~/mt5install && cd "$_"
 wget "$URL" -O mt5setup.exe || { echo "Failed to download MetaTrader"; exit 1; }
 wget "$URL_WEBVIEW" -O MicrosoftEdgeWebview2Setup.exe || { echo "Failed to download WebView2"; exit 1; }
 
@@ -44,7 +44,15 @@ wineboot --init
 sleep 5
 winetricks win10
 
-wine MicrosoftEdgeWebview2Setup.exe /silent /install
-wine mt5setup.exe
+wine MicrosoftEdgeWebview2Setup.exe /silent /install || echo "Warning: WebView2 may not have installed correctly."
+if [ -f "$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe" ]; then
+  echo "MetaTrader 5 is already installed, skipping setup..."
+else
+  wine mt5setup.exe || { echo "MetaTrader 5 installation failed"; exit 1; }
+fi
 
 wine "$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe" &
+
+wine_pid=$!
+wait $wine_pid
+timeout 60 wineserver -w || echo "Warning: Wine did not exit cleanly within 60 seconds."

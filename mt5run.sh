@@ -5,10 +5,14 @@ WINEPREFIX="$HOME/.mt5"
 MT5_PATH="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 
 if [ ! -f "$MT5_PATH" ]; then
-  echo "Error: MetaTrader 5 not found at:"
-  echo "  $MT5_PATH"
-  echo "Please ensure it is installed correctly."
-  exit 1
+    echo "Error: MetaTrader 5 not found at:"
+    echo "  $MT5_PATH"
+    echo "Please ensure it is installed correctly."
+    exit 1
 fi
 
 wine "$MT5_PATH"
+
+wine_pid=$!
+wait $wine_pid
+timeout 60 wineserver -w || echo "Warning: Wine did not exit cleanly within 60 seconds."
