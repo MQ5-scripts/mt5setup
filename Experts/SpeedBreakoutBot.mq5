@@ -20,6 +20,9 @@ input int      MaxPositions         = 1;          // Maximum open positions
 input int      StartupMonitorMinutes = 20;        // Monitor-only period before trading (minutes)
 input int      OrderUpdateMinutes   = 5;          // Minimum minutes between order updates (NEW)
 input bool     UseLastCompletedCandle = true;     // Use last completed candle for speed (NEW)
+input bool     EnableTrailingStops  = true;       // Enable trailing stops for executed positions
+input double   TrailingStepPoints   = 50;         // Minimum points to move before trailing
+input int      PositionUpdateMinutes = 1;         // Minimum minutes between position updates
 
 // Order tickets
 ulong buyStopTicket = 0;
@@ -30,6 +33,19 @@ datetime lastPositionCheck = 0;
 datetime botStartTime = 0;
 datetime botStartTimeLocal = 0;
 datetime lastOrderUpdate = 0;  // NEW: Track last order update time
+datetime lastPositionUpdate = 0;  // Track last position update time
+
+// Trailing stop tracking
+struct PositionTracker {
+   ulong ticket;
+   double highestPrice;    // For BUY positions
+   double lowestPrice;     // For SELL positions
+   double lastSL;
+   double lastTP;
+   datetime lastUpdate;
+};
+PositionTracker positionTrackers[10];  // Support up to 10 positions
+int trackerCount = 0;
 
 //+------------------------------------------------------------------+
 int OnInit() {
@@ -59,6 +75,10 @@ int OnInit() {
    Print("Order update frequency: ", OrderUpdateMinutes, " minutes");
    Print("Dynamic orders: ", EnableDynamicOrders ? "ENABLED" : "DISABLED");
    Print("Speed calculation using: ", UseLastCompletedCandle ? "Last completed candle" : "Current candle");
+   Print("Trailing stops: ", EnableTrailingStops ? "ENABLED" : "DISABLED");
+   if (EnableTrailingStops) {
+      Print("Trailing step: ", TrailingStepPoints, " points, Update frequency: ", PositionUpdateMinutes, " minutes");
+   }
    
    datetime tradingStartTimeLocal = botStartTimeLocal + StartupMonitorMinutes * 60;
    Print("Server time: ", TimeToString(botStartTime, TIME_MINUTES));
@@ -73,6 +93,8 @@ int OnInit() {
 void OnDeinit(const int reason) {
    EventKillTimer();
    CancelOrders(); // Clean up on shutdown
+   // Clear position trackers
+   trackerCount = 0;
    Print("SpeedBreakoutBot deinitialized. Reason: ", reason);
 }
 //+------------------------------------------------------------------+
@@ -216,6 +238,182 @@ int CountOpenPositions() {
 bool HasPendingOrders() {
    return (buyStopTicket > 0 && OrderSelect(buyStopTicket)) || 
           (sellStopTicket > 0 && OrderSelect(sellStopTicket));
+}
+//+------------------------------------------------------------------+
+// Position tracking and trailing stop functions
+//+------------------------------------------------------------------+
+int FindPositionTracker(ulong ticket) {
+   for (int i = 0; i < trackerCount; i++) {
+      if (positionTrackers[i].ticket == ticket) {
+         return i;
+      }
+   }
+   return -1;
+}
+//+------------------------------------------------------------------+
+void AddPositionTracker(ulong ticket, ENUM_POSITION_TYPE posType, double openPrice, double sl, double tp) {
+   if (trackerCount >= 10) return; // Maximum trackers reached
+   
+   int index = trackerCount++;
+   positionTrackers[index].ticket = ticket;
+   positionTrackers[index].lastSL = sl;
+   positionTrackers[index].lastTP = tp;
+   positionTrackers[index].lastUpdate = TimeCurrent();
+   
+   if (posType == POSITION_TYPE_BUY) {
+      positionTrackers[index].highestPrice = openPrice;
+      positionTrackers[index].lowestPrice = 0; // Not used for BUY
+   } else {
+      positionTrackers[index].lowestPrice = openPrice;
+      positionTrackers[index].highestPrice = 0; // Not used for SELL
+   }
+   
+   Print("Added position tracker for ticket ", ticket, " (Type: ", EnumToString(posType), ", Open: ", openPrice, ")");
+}
+//+------------------------------------------------------------------+
+void RemovePositionTracker(ulong ticket) {
+   int index = FindPositionTracker(ticket);
+   if (index < 0) return;
+   
+   // Shift remaining trackers
+   for (int i = index; i < trackerCount - 1; i++) {
+      positionTrackers[i] = positionTrackers[i + 1];
+   }
+   trackerCount--;
+   
+   Print("Removed position tracker for ticket ", ticket);
+}
+//+------------------------------------------------------------------+
+bool ModifyPosition(ulong ticket, double newSL, double newTP) {
+   if (ticket <= 0) return false;
+   
+   if (!PositionSelectByTicket(ticket)) {
+      Print("Error: Position ", ticket, " not found for modification");
+      return false;
+   }
+   
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double currentTP = PositionGetDouble(POSITION_TP);
+   
+   // Check if modification is actually needed
+   if (MathAbs(currentSL - newSL) < _Point && MathAbs(currentTP - newTP) < _Point) {
+      return true; // No change needed
+   }
+   
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+   
+   request.action = TRADE_ACTION_SLTP;
+   request.symbol = InpSymbol;
+   request.position = ticket;
+   request.sl = NormalizeDouble(newSL, _Digits);
+   request.tp = NormalizeDouble(newTP, _Digits);
+   
+   bool success = OrderSend(request, result);
+   if (!success || result.retcode != TRADE_RETCODE_DONE) {
+      Print("Error modifying position ", ticket, ": ", result.comment, " (", result.retcode, ")");
+      return false;
+   }
+   
+   Print("Position ", ticket, " SL/TP modified successfully. New SL: ", newSL, ", New TP: ", newTP);
+   return true;
+}
+//+------------------------------------------------------------------+
+void UpdatePositionTrackers() {
+   if (!EnableTrailingStops) return;
+   
+   datetime now = TimeCurrent();
+   if (now - lastPositionUpdate < PositionUpdateMinutes * 60) {
+      return; // Rate limited
+   }
+   
+   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   
+   // Check all tracked positions
+   for (int i = trackerCount - 1; i >= 0; i--) {
+      ulong ticket = positionTrackers[i].ticket;
+      
+      if (!PositionSelectByTicket(ticket)) {
+         // Position closed, remove tracker
+         RemovePositionTracker(ticket);
+         continue;
+      }
+      
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double currentPrice = (posType == POSITION_TYPE_BUY) ? bid : ask;
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      
+      bool shouldUpdate = false;
+      double newSL = currentSL;
+      double newTP = currentTP;
+      
+      if (posType == POSITION_TYPE_BUY) {
+         // For BUY positions: trail stops UP when price moves UP
+         if (currentPrice > positionTrackers[i].highestPrice) {
+            double priceMove = currentPrice - positionTrackers[i].highestPrice;
+            if (priceMove >= TrailingStepPoints * _Point) {
+               // Update highest price
+               positionTrackers[i].highestPrice = currentPrice;
+               
+               // Move SL and TP up by the same amount
+               newSL = currentSL + priceMove;
+               newTP = currentTP + priceMove;
+               shouldUpdate = true;
+               
+               Print("BUY position ", ticket, " trailing: Price moved up by ", priceMove, " points");
+            }
+         }
+      } else if (posType == POSITION_TYPE_SELL) {
+         // For SELL positions: trail stops DOWN when price moves DOWN
+         if (currentPrice < positionTrackers[i].lowestPrice) {
+            double priceMove = positionTrackers[i].lowestPrice - currentPrice;
+            if (priceMove >= TrailingStepPoints * _Point) {
+               // Update lowest price
+               positionTrackers[i].lowestPrice = currentPrice;
+               
+               // Move SL and TP down by the same amount
+               newSL = currentSL - priceMove;
+               newTP = currentTP - priceMove;
+               shouldUpdate = true;
+               
+               Print("SELL position ", ticket, " trailing: Price moved down by ", priceMove, " points");
+            }
+         }
+      }
+      
+      if (shouldUpdate) {
+         if (ModifyPosition(ticket, newSL, newTP)) {
+            positionTrackers[i].lastSL = newSL;
+            positionTrackers[i].lastTP = newTP;
+            positionTrackers[i].lastUpdate = now;
+         }
+      }
+   }
+   
+   lastPositionUpdate = now;
+}
+//+------------------------------------------------------------------+
+void CheckForNewPositions() {
+   // Check for new positions that aren't being tracked yet
+   for (int i = 0; i < PositionsTotal(); i++) {
+      if (PositionGetSymbol(i) == InpSymbol) {
+         ulong ticket = PositionGetTicket(i);
+         
+         if (FindPositionTracker(ticket) < 0) {
+            // New position found, add tracker
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double sl = PositionGetDouble(POSITION_SL);
+            double tp = PositionGetDouble(POSITION_TP);
+            
+            AddPositionTracker(ticket, posType, openPrice, sl, tp);
+         }
+      }
+   }
 }
 //+------------------------------------------------------------------+
 ulong PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double sl, double tp) {
@@ -431,6 +629,12 @@ void OnTimer() {
    // Clean up executed or cancelled orders
    CheckAndCleanupExecutedOrders();
    
+   // Check for new positions and update trailing stops
+   if (EnableTrailingStops) {
+      CheckForNewPositions();
+      UpdatePositionTrackers();
+   }
+   
    // Get current prices
    double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
@@ -457,6 +661,9 @@ void OnTimer() {
       }
       Print("  Current: ", speedNow, ", Average: ", avgSpeed, ", Max: ", maxSpeed, ", Threshold: ", threshold);
       Print("  Active positions: ", CountOpenPositions(), ", Pending orders: ", (buyStopTicket > 0 ? 1 : 0) + (sellStopTicket > 0 ? 1 : 0));
+      if (EnableTrailingStops && trackerCount > 0) {
+         Print("  Tracked positions: ", trackerCount);
+      }
       
       if (speedNow >= threshold) {
          if (isStartupPeriod) {
@@ -500,5 +707,10 @@ void OnTick() {
    
    // Clean up executed orders immediately
    CheckAndCleanupExecutedOrders();
+   
+   // Check for new positions immediately when they're created
+   if (EnableTrailingStops) {
+      CheckForNewPositions();
+   }
 }
 //+------------------------------------------------------------------+
