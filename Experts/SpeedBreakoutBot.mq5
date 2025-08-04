@@ -15,9 +15,11 @@ input double   LotSize              = 0.1;
 input int      TradingStartHour     = 8;
 input int      TradingEndHour       = 16;
 input int      TimerIntervalSeconds = 30;         // Timer interval in seconds
-input bool     EnableDynamicOrders  = true;       // Enable dynamic order updates
+input bool     EnableDynamicOrders  = false;      // Enable dynamic order updates (CHANGED: default false)
 input int      MaxPositions         = 1;          // Maximum open positions
 input int      StartupMonitorMinutes = 20;        // Monitor-only period before trading (minutes)
+input int      OrderUpdateMinutes   = 5;          // Minimum minutes between order updates (NEW)
+input bool     UseLastCompletedCandle = true;     // Use last completed candle for speed (NEW)
 
 // Order tickets
 ulong buyStopTicket = 0;
@@ -27,6 +29,7 @@ ulong sellStopTicket = 0;
 datetime lastPositionCheck = 0;
 datetime botStartTime = 0;
 datetime botStartTimeLocal = 0;
+datetime lastOrderUpdate = 0;  // NEW: Track last order update time
 
 //+------------------------------------------------------------------+
 int OnInit() {
@@ -53,6 +56,9 @@ int OnInit() {
    Print("SpeedBreakoutBot initialized successfully");
    Print("Timer interval: ", TimerIntervalSeconds, " seconds");
    Print("Trading hours: ", TradingStartHour, ":00 - ", TradingEndHour, ":00");
+   Print("Order update frequency: ", OrderUpdateMinutes, " minutes");
+   Print("Dynamic orders: ", EnableDynamicOrders ? "ENABLED" : "DISABLED");
+   Print("Speed calculation using: ", UseLastCompletedCandle ? "Last completed candle" : "Current candle");
    
    datetime tradingStartTimeLocal = botStartTimeLocal + StartupMonitorMinutes * 60;
    Print("Server time: ", TimeToString(botStartTime, TIME_MINUTES));
@@ -97,41 +103,46 @@ double CalculateSpeedInternal(int shift) {
 }
 //+------------------------------------------------------------------+
 double CalculateCurrentSpeed() {
-   // For current speed, we have several options:
-   // Option 1: Use the last completed candle (most reliable)
-   // Option 2: Use current candle's range (open to current price)
-   // Option 3: Use recent price movement over last few ticks
-   
-   // Let's use Option 2: Current candle's movement from open to current price
-   double open = iOpen(InpSymbol, InpTimeframe, 0);
-   double currentPrice = (SymbolInfoDouble(InpSymbol, SYMBOL_ASK) + SymbolInfoDouble(InpSymbol, SYMBOL_BID)) / 2.0;
-   double currentCandleSpeed = MathAbs(currentPrice - open);
-   
-   // Also calculate the last completed candle speed for comparison
-   double lastCompletedSpeed = CalculateSpeed(1);
-   
-   // Use current candle speed primarily, but if it's very small and we're early in the candle,
-   // consider last completed candle as a backup reference
-   double speed = currentCandleSpeed;
-   
-   // If current candle speed is very small, we might want to check if there was recent activity
-   if (currentCandleSpeed < lastCompletedSpeed * 0.1) {
-      // Current candle is much quieter than last one, use current candle speed (which is low)
-      speed = currentCandleSpeed;
+   // IMPROVED: Allow choice between current candle and last completed candle
+   if (UseLastCompletedCandle) {
+      // Use last completed candle (more reliable)
+      double speed = CalculateSpeed(1);
+      
+      static datetime lastDebugTime = 0;
+      datetime currentTime = TimeCurrent();
+      if (currentTime - lastDebugTime > 60) {
+         Print("DEBUG Speed calculation (using last completed candle):");
+         Print("  Last completed candle speed: ", speed);
+         lastDebugTime = currentTime;
+      }
+      
+      return speed;
+   } else {
+      // Original logic - use current candle
+      double open = iOpen(InpSymbol, InpTimeframe, 0);
+      double currentPrice = (SymbolInfoDouble(InpSymbol, SYMBOL_ASK) + SymbolInfoDouble(InpSymbol, SYMBOL_BID)) / 2.0;
+      double currentCandleSpeed = MathAbs(currentPrice - open);
+      
+      double lastCompletedSpeed = CalculateSpeed(1);
+      double speed = currentCandleSpeed;
+      
+      if (currentCandleSpeed < lastCompletedSpeed * 0.1) {
+         speed = currentCandleSpeed;
+      }
+      
+      static datetime lastDebugTime = 0;
+      datetime currentTime = TimeCurrent();
+      if (currentTime - lastDebugTime > 60) {
+         Print("DEBUG Speed calculation (using current candle):");
+         Print("  Current candle open: ", open, ", Current mid price: ", currentPrice);
+         Print("  Current candle speed: ", currentCandleSpeed);
+         Print("  Last completed candle speed: ", lastCompletedSpeed);
+         Print("  Selected speed: ", speed);
+         lastDebugTime = currentTime;
+      }
+      
+      return speed;
    }
-   
-   static datetime lastDebugTime = 0;
-   datetime currentTime = TimeCurrent();
-   if (currentTime - lastDebugTime > 60) { // Debug every minute
-      Print("DEBUG Speed calculation:");
-      Print("  Current candle open: ", open, ", Current mid price: ", currentPrice);
-      Print("  Current candle speed: ", currentCandleSpeed);
-      Print("  Last completed candle speed: ", lastCompletedSpeed);
-      Print("  Selected speed: ", speed, " (using current candle speed)");
-      lastDebugTime = currentTime;
-   }
-   
-   return speed;
 }
 //+------------------------------------------------------------------+
 double AverageSpeed() {
@@ -269,19 +280,40 @@ bool ModifyOrder(ulong ticket, double newPrice, double newSL, double newTP) {
 }
 //+------------------------------------------------------------------+
 void PlaceOrUpdateOrders(double ask, double bid) {
-   double speedNow = CalculateCurrentSpeed(); // Use new current speed calculation
+   double speedNow = CalculateCurrentSpeed();
    double avgSpeed = AverageSpeed();
    double threshold = avgSpeed * SpeedMultiplier;
-
-   if (speedNow < threshold) {
-      if (!EnableDynamicOrders) {
-         return; // Not fast enough and dynamic updates disabled
+   
+   // FIXED: Only proceed if speed threshold is met OR we don't have any orders yet
+   bool speedTriggered = (speedNow >= threshold);
+   bool hasOrders = (buyStopTicket > 0 || sellStopTicket > 0);
+   
+   if (!speedTriggered && hasOrders) {
+      // Speed not high enough and we already have orders - don't modify them
+      static datetime lastNoSpeedMessage = 0;
+      datetime now = TimeCurrent();
+      if (now - lastNoSpeedMessage > 300) { // Message every 5 minutes
+         Print("Speed below threshold (", speedNow, " < ", threshold, "). Keeping existing orders unchanged.");
+         lastNoSpeedMessage = now;
       }
+      return;
    }
    
    // Check if we already have maximum positions
    if (CountOpenPositions() >= MaxPositions) {
       Print("Maximum positions (", MaxPositions, ") reached. Skipping new orders.");
+      return;
+   }
+   
+   // IMPROVED: Rate limit order updates
+   datetime now = TimeCurrent();
+   if (EnableDynamicOrders && hasOrders && (now - lastOrderUpdate < OrderUpdateMinutes * 60)) {
+      static datetime lastRateLimitMessage = 0;
+      if (now - lastRateLimitMessage > 300) { // Message every 5 minutes
+         int remainingMinutes = (int)((OrderUpdateMinutes * 60 - (now - lastOrderUpdate)) / 60) + 1;
+         Print("Order update rate limited. Next update allowed in ", remainingMinutes, " minutes.");
+         lastRateLimitMessage = now;
+      }
       return;
    }
 
@@ -293,10 +325,14 @@ void PlaceOrUpdateOrders(double ask, double bid) {
    double sellSL = NormalizeDouble(sellPrice + SL_Points * _Point, _Digits);
    double sellTP = NormalizeDouble(sellPrice - TP_Points * _Point, _Digits);
 
+   bool ordersModified = false;
+
    // Handle BUY STOP order
    if (buyStopTicket > 0 && OrderSelect(buyStopTicket)) {
-      if (EnableDynamicOrders) {
-         if (!ModifyOrder(buyStopTicket, buyPrice, buySL, buyTP)) {
+      if (EnableDynamicOrders && speedTriggered) {
+         if (ModifyOrder(buyStopTicket, buyPrice, buySL, buyTP)) {
+            ordersModified = true;
+         } else {
             // If modification fails, cancel and recreate
             CancelOrder(buyStopTicket);
             buyStopTicket = 0;
@@ -304,14 +340,17 @@ void PlaceOrUpdateOrders(double ask, double bid) {
       }
    }
    
-   if (buyStopTicket == 0 && speedNow >= threshold) {
+   if (buyStopTicket == 0 && speedTriggered) {
       buyStopTicket = PlacePendingOrder(ORDER_TYPE_BUY_STOP, buyPrice, buySL, buyTP);
+      if (buyStopTicket > 0) ordersModified = true;
    }
 
    // Handle SELL STOP order
    if (sellStopTicket > 0 && OrderSelect(sellStopTicket)) {
-      if (EnableDynamicOrders) {
-         if (!ModifyOrder(sellStopTicket, sellPrice, sellSL, sellTP)) {
+      if (EnableDynamicOrders && speedTriggered) {
+         if (ModifyOrder(sellStopTicket, sellPrice, sellSL, sellTP)) {
+            ordersModified = true;
+         } else {
             // If modification fails, cancel and recreate
             CancelOrder(sellStopTicket);
             sellStopTicket = 0;
@@ -319,8 +358,15 @@ void PlaceOrUpdateOrders(double ask, double bid) {
       }
    }
    
-   if (sellStopTicket == 0 && speedNow >= threshold) {
+   if (sellStopTicket == 0 && speedTriggered) {
       sellStopTicket = PlacePendingOrder(ORDER_TYPE_SELL_STOP, sellPrice, sellSL, sellTP);
+      if (sellStopTicket > 0) ordersModified = true;
+   }
+   
+   // Update last order update time if any orders were modified/created
+   if (ordersModified) {
+      lastOrderUpdate = now;
+      Print("Orders updated due to speed trigger: ", speedNow, " >= ", threshold);
    }
 }
 //+------------------------------------------------------------------+
@@ -352,12 +398,14 @@ void CheckAndCleanupExecutedOrders() {
    if (buyStopTicket > 0 && !OrderSelect(buyStopTicket)) {
       Print("Buy stop order ", buyStopTicket, " no longer exists (executed or cancelled)");
       buyStopTicket = 0;
+      lastOrderUpdate = 0; // Reset rate limit when order is executed
    }
    
    // Check if sell stop order was executed or cancelled
    if (sellStopTicket > 0 && !OrderSelect(sellStopTicket)) {
       Print("Sell stop order ", sellStopTicket, " no longer exists (executed or cancelled)");
       sellStopTicket = 0;
+      lastOrderUpdate = 0; // Reset rate limit when order is executed
    }
 }
 //+------------------------------------------------------------------+
@@ -419,6 +467,15 @@ void OnTimer() {
       } else {
          Print("  Waiting for speed trigger. Need: ", threshold, ", Current: ", speedNow);
       }
+      
+      // Show next order update time if rate limited
+      if (EnableDynamicOrders && lastOrderUpdate > 0) {
+         int nextUpdateMinutes = (int)((OrderUpdateMinutes * 60 - (now - lastOrderUpdate)) / 60) + 1;
+         if (nextUpdateMinutes > 0) {
+            Print("  Next order update allowed in: ", nextUpdateMinutes, " minutes");
+         }
+      }
+      
       logCounter = 0;
    }
    
