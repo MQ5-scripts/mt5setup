@@ -1,114 +1,4 @@
 //+------------------------------------------------------------------+
-void CheckOrderIntegrity() {
-    // Count our existing orders
-    int buyStopCount = 0;
-    int sellStopCount = 0;
-    ulong foundBuyTicket = 0;
-    ulong foundSellTicket = 0;
-    
-    for (int i = 0; i < OrdersTotal(); i++) {
-        if (OrderGetTicket(i) > 0) {
-            string orderSymbol = OrderGetString(ORDER_SYMBOL);
-            ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
-            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            ulong ticket = OrderGetTicket(i);
-            
-            if (orderSymbol == currentSymbol && orderMagic == MagicNumber) {
-                if (orderType == ORDER_TYPE_BUY_STOP) {
-                    buyStopCount++;
-                    if (buyStopCount == 1) foundBuyTicket = ticket;
-                } else if (orderType == ORDER_TYPE_SELL_STOP) {
-                    sellStopCount++;
-                    if (sellStopCount == 1) foundSellTicket = ticket;
-                }
-            }
-        }
-    }
-    
-    // If we have more than one of each type, delete extras
-    if (buyStopCount > 1) {
-        Print("WARNING: Found ", buyStopCount, " BUY STOP orders, cleaning up extras...");
-        for (int i = OrdersTotal() - 1; i >= 0; i--) {
-            if (OrderGetTicket(i) > 0) {
-                string orderSymbol = OrderGetString(ORDER_SYMBOL);
-                ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
-                ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-                ulong ticket = OrderGetTicket(i);
-                
-                if (orderSymbol == currentSymbol && orderMagic == MagicNumber && 
-                    orderType == ORDER_TYPE_BUY_STOP && ticket != foundBuyTicket) {
-                    DeleteOrder(ticket);
-                    Print("Deleted extra BUY STOP order: ", ticket);
-                }
-            }
-        }
-    }
-    
-    if (sellStopCount > 1) {
-        Print("WARNING: Found ", sellStopCount, " SELL STOP orders, cleaning up extras...");
-        for (int i = OrdersTotal() - 1; i >= 0; i--) {
-            if (OrderGetTicket(i) > 0) {
-                string orderSymbol = OrderGetString(ORDER_SYMBOL);
-                ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
-                ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-                ulong ticket = OrderGetTicket(i);
-                
-                if (orderSymbol == currentSymbol && orderMagic == MagicNumber && 
-                    orderType == ORDER_TYPE_SELL_STOP && ticket != foundSellTicket) {
-                    DeleteOrder(ticket);
-                    Print("Deleted extra SELL STOP order: ", ticket);
-                }
-            }
-        }
-    }
-    
-    // Update our ticket variables with the found orders
-    if (buyStopCount == 1 && buyStopTicket != foundBuyTicket) {
-        buyStopTicket = foundBuyTicket;
-        Print("Updated BUY STOP ticket to: ", buyStopTicket);
-    } else if (buyStopCount == 0) {
-        buyStopTicket = 0;
-    }
-    
-    if (sellStopCount == 1 && sellStopTicket != foundSellTicket) {
-        sellStopTicket = foundSellTicket;
-        Print("Updated SELL STOP ticket to: ", sellStopTicket);
-    } else if (sellStopCount == 0) {
-        sellStopTicket = 0;
-    }
-}
-
-//+------------------------------------------------------------------+
-void CleanupExistingOrders() {
-    int totalOrders = OrdersTotal();
-    Print("Cleaning up existing orders. Total pending orders: ", totalOrders);
-    
-    for (int i = totalOrders - 1; i >= 0; i--) {
-        if (OrderGetTicket(i) > 0) {
-            string orderSymbol = OrderGetString(ORDER_SYMBOL);
-            ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
-            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            ulong ticket = OrderGetTicket(i);
-            
-            // Delete orders that match our symbol and magic number
-            if (orderSymbol == currentSymbol && orderMagic == MagicNumber) {
-                if (orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP) {
-                    if (DeleteOrder(ticket)) {
-                        Print("Deleted existing ", EnumToString(orderType), " order: ", ticket);
-                    }
-                }
-            }
-        }
-    }
-    
-    // Reset ticket variables
-    buyStopTicket = 0;
-    sellStopTicket = 0;
-    
-    Print("Cleanup completed. Buy/Sell stop tickets reset.");
-}
-
-//+------------------------------------------------------------------+
 //|                                       PercentageTrailingBot.mq5  |
 //|                                       Advanced Percentage-Based  |
 //|                                       Trailing Stop Expert       |
@@ -116,18 +6,19 @@ void CleanupExistingOrders() {
 #property strict
 
 // Input Parameters
-input double   OrderDeltaPercent     = 0.1;        // Price delta between stop orders (%)
+input double   OrderDeltaPercent     = 0.65;       // Price delta between pending orders (%)
 input double   RiskPercent           = 1.0;        // Maximum risk per trade (% of account)
-input double   TrailingPercent       = 50.0;       // Trailing percentage between open and current price (%)
-input int      UpdateIntervalSeconds = 300;        // Update interval for pending orders (seconds)
+input double   TrailingPercent       = 70.0;       // Trailing percentage between open and current price (%)
+input bool     UseStopOrders         = false;      // true = BUY/SELL STOP, false = BUY/SELL LIMIT
+input int      UpdateIntervalSeconds = 450;        // Update interval for pending orders (seconds)
 input int      MagicNumber           = 123456;     // Magic number for orders
 input string   TradeComment          = "PCT_Trail"; // Comment for trades
 
 // Global variables
 string currentSymbol;
 ENUM_TIMEFRAMES currentTimeframe;
-ulong buyStopTicket = 0;
-ulong sellStopTicket = 0;
+ulong buyOrderTicket = 0;    // BUY STOP or BUY LIMIT ticket
+ulong sellOrderTicket = 0;   // SELL STOP or SELL LIMIT ticket
 datetime lastPendingUpdate = 0;
 
 // Broker specification cache
@@ -160,6 +51,7 @@ int OnInit() {
     Print("PercentageTrailingBot initialized successfully");
     Print("Symbol: ", currentSymbol, ", Timeframe: ", EnumToString(currentTimeframe));
     Print("Order delta: ", OrderDeltaPercent, "%, Risk: ", RiskPercent, "%, Trailing: ", TrailingPercent, "%");
+    Print("Order type: ", UseStopOrders ? "STOP orders" : "LIMIT orders");
     Print("Update interval: ", UpdateIntervalSeconds, " seconds");
     
     return INIT_SUCCEEDED;
@@ -234,6 +126,121 @@ double CalculateLotSize(double openPrice, double stopLoss) {
 }
 
 //+------------------------------------------------------------------+
+void CheckOrderIntegrity() {
+    // Count our existing orders
+    int buyOrderCount = 0;
+    int sellOrderCount = 0;
+    ulong foundBuyTicket = 0;
+    ulong foundSellTicket = 0;
+    
+    // Determine which order types we're looking for
+    ENUM_ORDER_TYPE buyOrderType = UseStopOrders ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_BUY_LIMIT;
+    ENUM_ORDER_TYPE sellOrderType = UseStopOrders ? ORDER_TYPE_SELL_STOP : ORDER_TYPE_SELL_LIMIT;
+    
+    for (int i = 0; i < OrdersTotal(); i++) {
+        if (OrderGetTicket(i) > 0) {
+            string orderSymbol = OrderGetString(ORDER_SYMBOL);
+            ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
+            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            ulong ticket = OrderGetTicket(i);
+            
+            if (orderSymbol == currentSymbol && orderMagic == MagicNumber) {
+                if (orderType == buyOrderType) {
+                    buyOrderCount++;
+                    if (buyOrderCount == 1) foundBuyTicket = ticket;
+                } else if (orderType == sellOrderType) {
+                    sellOrderCount++;
+                    if (sellOrderCount == 1) foundSellTicket = ticket;
+                }
+            }
+        }
+    }
+    
+    // If we have more than one of each type, delete extras
+    if (buyOrderCount > 1) {
+        Print("WARNING: Found ", buyOrderCount, " ", EnumToString(buyOrderType), " orders, cleaning up extras...");
+        for (int i = OrdersTotal() - 1; i >= 0; i--) {
+            if (OrderGetTicket(i) > 0) {
+                string orderSymbol = OrderGetString(ORDER_SYMBOL);
+                ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
+                ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                ulong ticket = OrderGetTicket(i);
+                
+                if (orderSymbol == currentSymbol && orderMagic == MagicNumber && 
+                    orderType == buyOrderType && ticket != foundBuyTicket) {
+                    DeleteOrder(ticket);
+                    Print("Deleted extra ", EnumToString(buyOrderType), " order: ", ticket);
+                }
+            }
+        }
+    }
+    
+    if (sellOrderCount > 1) {
+        Print("WARNING: Found ", sellOrderCount, " ", EnumToString(sellOrderType), " orders, cleaning up extras...");
+        for (int i = OrdersTotal() - 1; i >= 0; i--) {
+            if (OrderGetTicket(i) > 0) {
+                string orderSymbol = OrderGetString(ORDER_SYMBOL);
+                ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
+                ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+                ulong ticket = OrderGetTicket(i);
+                
+                if (orderSymbol == currentSymbol && orderMagic == MagicNumber && 
+                    orderType == sellOrderType && ticket != foundSellTicket) {
+                    DeleteOrder(ticket);
+                    Print("Deleted extra ", EnumToString(sellOrderType), " order: ", ticket);
+                }
+            }
+        }
+    }
+    
+    // Update our ticket variables with the found orders
+    if (buyOrderCount == 1 && buyOrderTicket != foundBuyTicket) {
+        buyOrderTicket = foundBuyTicket;
+        Print("Updated ", EnumToString(buyOrderType), " ticket to: ", buyOrderTicket);
+    } else if (buyOrderCount == 0) {
+        buyOrderTicket = 0;
+    }
+    
+    if (sellOrderCount == 1 && sellOrderTicket != foundSellTicket) {
+        sellOrderTicket = foundSellTicket;
+        Print("Updated ", EnumToString(sellOrderType), " ticket to: ", sellOrderTicket);
+    } else if (sellOrderCount == 0) {
+        sellOrderTicket = 0;
+    }
+}
+
+//+------------------------------------------------------------------+
+void CleanupExistingOrders() {
+    int totalOrders = OrdersTotal();
+    Print("Cleaning up existing orders. Total pending orders: ", totalOrders);
+    
+    for (int i = totalOrders - 1; i >= 0; i--) {
+        if (OrderGetTicket(i) > 0) {
+            string orderSymbol = OrderGetString(ORDER_SYMBOL);
+            ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
+            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            ulong ticket = OrderGetTicket(i);
+            
+            // Delete orders that match our symbol and magic number
+            if (orderSymbol == currentSymbol && orderMagic == MagicNumber) {
+                if (orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP ||
+                    orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT) {
+                    if (DeleteOrder(ticket)) {
+                        Print("Deleted existing ", EnumToString(orderType), " order: ", ticket);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Reset ticket variables
+    buyOrderTicket = 0;
+    sellOrderTicket = 0;
+    
+    Print("Cleanup completed. Buy/Sell order tickets reset.");
+}
+
+//+------------------------------------------------------------------+
 bool HasMarketPositions() {
     for (int i = 0; i < PositionsTotal(); i++) {
         if (PositionGetSymbol(i) == currentSymbol) {
@@ -250,18 +257,20 @@ bool HasMarketPositions() {
 void DeletePendingOrders() {
     bool ordersDeleted = false;
     
-    if (buyStopTicket > 0) {
-        if (DeleteOrder(buyStopTicket)) {
-            Print("Deleted BUY STOP order: ", buyStopTicket);
-            buyStopTicket = 0;
+    if (buyOrderTicket > 0) {
+        if (DeleteOrder(buyOrderTicket)) {
+            string orderType = UseStopOrders ? "BUY STOP" : "BUY LIMIT";
+            Print("Deleted ", orderType, " order: ", buyOrderTicket);
+            buyOrderTicket = 0;
             ordersDeleted = true;
         }
     }
     
-    if (sellStopTicket > 0) {
-        if (DeleteOrder(sellStopTicket)) {
-            Print("Deleted SELL STOP order: ", sellStopTicket);
-            sellStopTicket = 0;
+    if (sellOrderTicket > 0) {
+        if (DeleteOrder(sellOrderTicket)) {
+            string orderType = UseStopOrders ? "SELL STOP" : "SELL LIMIT";
+            Print("Deleted ", orderType, " order: ", sellOrderTicket);
+            sellOrderTicket = 0;
             ordersDeleted = true;
         }
     }
@@ -456,9 +465,18 @@ void ManagePendingOrders() {
         deltaDistance = minDistance;
     }
     
-    // Calculate order prices
-    double buyStopPrice = NormalizePrice(midPrice + deltaDistance / 2.0);
-    double sellStopPrice = NormalizePrice(midPrice - deltaDistance / 2.0);
+    // Calculate order prices based on order type
+    double buyOrderPrice, sellOrderPrice;
+    
+    if (UseStopOrders) {
+        // STOP orders: BUY STOP above price, SELL STOP below price
+        buyOrderPrice = NormalizePrice(midPrice + deltaDistance / 2.0);
+        sellOrderPrice = NormalizePrice(midPrice - deltaDistance / 2.0);
+    } else {
+        // LIMIT orders: BUY LIMIT below price, SELL LIMIT above price
+        buyOrderPrice = NormalizePrice(midPrice - deltaDistance / 2.0);
+        sellOrderPrice = NormalizePrice(midPrice + deltaDistance / 2.0);
+    }
     
     // Calculate SL and TP distances (0.1% each)
     double slDistance = CalculatePercentageDistance(midPrice, OrderDeltaPercent);
@@ -473,26 +491,25 @@ void ManagePendingOrders() {
     }
     
     // Calculate SL and TP for each order
-    double buySL = NormalizePrice(buyStopPrice - slDistance);
-    double buyTP = NormalizePrice(buyStopPrice + tpDistance);
-    double sellSL = NormalizePrice(sellStopPrice + slDistance);
-    double sellTP = NormalizePrice(sellStopPrice - tpDistance);
+    double buySL = NormalizePrice(buyOrderPrice - slDistance);
+    double buyTP = NormalizePrice(buyOrderPrice + tpDistance);
+    double sellSL = NormalizePrice(sellOrderPrice + slDistance);
+    double sellTP = NormalizePrice(sellOrderPrice - tpDistance);
     
     // Calculate lot sizes
-    double buyLotSize = CalculateLotSize(buyStopPrice, buySL);
-    double sellLotSize = CalculateLotSize(sellStopPrice, sellSL);
+    double buyLotSize = CalculateLotSize(buyOrderPrice, buySL);
+    double sellLotSize = CalculateLotSize(sellOrderPrice, sellSL);
     
-    // Manage BUY STOP order
-    ManageBuyStopOrder(buyStopPrice, buySL, buyTP, buyLotSize);
-    
-    // Manage SELL STOP order
-    ManageSellStopOrder(sellStopPrice, sellSL, sellTP, sellLotSize);
+    // Manage pending orders
+    ManageBuyOrder(buyOrderPrice, buySL, buyTP, buyLotSize);
+    ManageSellOrder(sellOrderPrice, sellSL, sellTP, sellLotSize);
     
     lastPendingUpdate = now;
     
     static datetime lastLogTime = 0;
     if (now - lastLogTime > 60) { // Log every minute
-        Print("Pending orders updated - BUY STOP: ", buyStopPrice, ", SELL STOP: ", sellStopPrice);
+        string orderTypeStr = UseStopOrders ? "STOP" : "LIMIT";
+        Print("Pending orders updated - BUY ", orderTypeStr, ": ", buyOrderPrice, ", SELL ", orderTypeStr, ": ", sellOrderPrice);
         Print("Delta distance: ", deltaDistance, " (", (deltaDistance/symbolPoint), " points)");
         Print("Lot sizes - BUY: ", buyLotSize, ", SELL: ", sellLotSize);
         lastLogTime = now;
@@ -500,10 +517,10 @@ void ManagePendingOrders() {
 }
 
 //+------------------------------------------------------------------+
-void ManageBuyStopOrder(double price, double sl, double tp, double lotSize) {
+void ManageBuyOrder(double price, double sl, double tp, double lotSize) {
     bool needsRecreate = false;
     
-    if (buyStopTicket > 0 && OrderSelect(buyStopTicket)) {
+    if (buyOrderTicket > 0 && OrderSelect(buyOrderTicket)) {
         // Check if current order needs modification
         double currentPrice = OrderGetDouble(ORDER_PRICE_OPEN);
         double currentSL = OrderGetDouble(ORDER_SL);
@@ -516,7 +533,7 @@ void ManageBuyStopOrder(double price, double sl, double tp, double lotSize) {
         }
         // Check if price changed significantly
         else if (MathAbs(currentPrice - price) > symbolPoint) {
-            if (ModifyOrder(buyStopTicket, price, sl, tp)) {
+            if (ModifyOrder(buyOrderTicket, price, sl, tp)) {
                 return; // Successfully modified
             } else {
                 needsRecreate = true;
@@ -524,7 +541,7 @@ void ManageBuyStopOrder(double price, double sl, double tp, double lotSize) {
         }
         // Check if SL/TP needs update
         else if (MathAbs(currentSL - sl) > symbolPoint || MathAbs(currentTP - tp) > symbolPoint) {
-            ModifyOrder(buyStopTicket, currentPrice, sl, tp);
+            ModifyOrder(buyOrderTicket, currentPrice, sl, tp);
             return;
         } else {
             return; // No changes needed
@@ -535,20 +552,21 @@ void ManageBuyStopOrder(double price, double sl, double tp, double lotSize) {
     
     if (needsRecreate) {
         // Delete existing order if it exists
-        if (buyStopTicket > 0) {
-            DeleteOrder(buyStopTicket);
+        if (buyOrderTicket > 0) {
+            DeleteOrder(buyOrderTicket);
         }
         
         // Create new order
-        buyStopTicket = PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, sl, tp, lotSize);
+        ENUM_ORDER_TYPE orderType = UseStopOrders ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_BUY_LIMIT;
+        buyOrderTicket = PlacePendingOrder(orderType, price, sl, tp, lotSize);
     }
 }
 
 //+------------------------------------------------------------------+
-void ManageSellStopOrder(double price, double sl, double tp, double lotSize) {
+void ManageSellOrder(double price, double sl, double tp, double lotSize) {
     bool needsRecreate = false;
     
-    if (sellStopTicket > 0 && OrderSelect(sellStopTicket)) {
+    if (sellOrderTicket > 0 && OrderSelect(sellOrderTicket)) {
         // Check if current order needs modification
         double currentPrice = OrderGetDouble(ORDER_PRICE_OPEN);
         double currentSL = OrderGetDouble(ORDER_SL);
@@ -561,7 +579,7 @@ void ManageSellStopOrder(double price, double sl, double tp, double lotSize) {
         }
         // Check if price changed significantly
         else if (MathAbs(currentPrice - price) > symbolPoint) {
-            if (ModifyOrder(sellStopTicket, price, sl, tp)) {
+            if (ModifyOrder(sellOrderTicket, price, sl, tp)) {
                 return; // Successfully modified
             } else {
                 needsRecreate = true;
@@ -569,7 +587,7 @@ void ManageSellStopOrder(double price, double sl, double tp, double lotSize) {
         }
         // Check if SL/TP needs update
         else if (MathAbs(currentSL - sl) > symbolPoint || MathAbs(currentTP - tp) > symbolPoint) {
-            ModifyOrder(sellStopTicket, currentPrice, sl, tp);
+            ModifyOrder(sellOrderTicket, currentPrice, sl, tp);
             return;
         } else {
             return; // No changes needed
@@ -580,12 +598,13 @@ void ManageSellStopOrder(double price, double sl, double tp, double lotSize) {
     
     if (needsRecreate) {
         // Delete existing order if it exists
-        if (sellStopTicket > 0) {
-            DeleteOrder(sellStopTicket);
+        if (sellOrderTicket > 0) {
+            DeleteOrder(sellOrderTicket);
         }
         
         // Create new order
-        sellStopTicket = PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, sl, tp, lotSize);
+        ENUM_ORDER_TYPE orderType = UseStopOrders ? ORDER_TYPE_SELL_STOP : ORDER_TYPE_SELL_LIMIT;
+        sellOrderTicket = PlacePendingOrder(orderType, price, sl, tp, lotSize);
     }
 }
 
@@ -645,16 +664,18 @@ bool ModifyOrder(ulong ticket, double newPrice, double newSL, double newTP) {
 
 //+------------------------------------------------------------------+
 void CleanupExecutedOrders() {
-    // Check if buy stop order was executed or cancelled
-    if (buyStopTicket > 0 && !OrderSelect(buyStopTicket)) {
-        Print("BUY STOP order ", buyStopTicket, " no longer exists (executed or cancelled)");
-        buyStopTicket = 0;
+    // Check if buy order was executed or cancelled
+    if (buyOrderTicket > 0 && !OrderSelect(buyOrderTicket)) {
+        string orderType = UseStopOrders ? "BUY STOP" : "BUY LIMIT";
+        Print(orderType, " order ", buyOrderTicket, " no longer exists (executed or cancelled)");
+        buyOrderTicket = 0;
     }
     
-    // Check if sell stop order was executed or cancelled
-    if (sellStopTicket > 0 && !OrderSelect(sellStopTicket)) {
-        Print("SELL STOP order ", sellStopTicket, " no longer exists (executed or cancelled)");
-        sellStopTicket = 0;
+    // Check if sell order was executed or cancelled
+    if (sellOrderTicket > 0 && !OrderSelect(sellOrderTicket)) {
+        string orderType = UseStopOrders ? "SELL STOP" : "SELL LIMIT";
+        Print(orderType, " order ", sellOrderTicket, " no longer exists (executed or cancelled)");
+        sellOrderTicket = 0;
     }
 }
 
